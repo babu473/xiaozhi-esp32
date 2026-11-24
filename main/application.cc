@@ -28,15 +28,27 @@ static uint8_t anima_receiver_mac[] = {0x28, 0x84, 0x85, 0x8A, 0x71, 0x28};
 
 static void sendMouthLevel(uint8_t level) {
     if (level > 100) level = 100;
+
+    uint8_t primary_chan = 0;
+    wifi_second_chan_t second_chan = WIFI_SECOND_CHAN_NONE;
+    esp_wifi_get_channel(&primary_chan, &second_chan);
+
     esp_now_peer_info_t peer_info = {};
     memcpy(peer_info.peer_addr, anima_receiver_mac, 6);
-    peer_info.channel = 0;
+    peer_info.channel = primary_chan;
     peer_info.encrypt = false;
 
     if (!esp_now_is_peer_exist(anima_receiver_mac)) {
         esp_now_add_peer(&peer_info);
+    } else {
+        esp_now_mod_peer(&peer_info);
     }
-    esp_now_send(anima_receiver_mac, &level, sizeof(level));
+
+    char payload[24];
+    int len = snprintf(payload, sizeof(payload), "AUDIO:%u", static_cast<unsigned int>(level));
+    if (len > 0) {
+        esp_now_send(anima_receiver_mac, reinterpret_cast<const uint8_t*>(payload), static_cast<size_t>(len));
+    }
 }
 
 #define TAG "Application"
@@ -611,26 +623,28 @@ void Application::InitializeProtocol() {
 
     protocol_->OnIncomingAudio([this](std::unique_ptr<AudioStreamPacket> packet) {
         if (GetDeviceState() == kDeviceStateSpeaking) {
-            audio_service_.PushPacketToDecodeQueue(std::move(packet));
-          if (packet && !packet->payload.empty()) {
-            const uint8_t* raw = packet->payload.data();
-            size_t len = packet->payload.size();
-            uint32_t sum = 0;
-            size_t step = (len > 32) ? (len / 32) : 1;
-            size_t samples_used = 0;
+            uint8_t level_to_send = 0;
+            if (packet && !packet->payload.empty()) {
+                const uint8_t* raw = packet->payload.data();
+                size_t len = packet->payload.size();
+                uint32_t sum = 0;
+                size_t step = (len > 32) ? (len / 32) : 1;
+                size_t samples_used = 0;
 
-            for (size_t i = 0; i < len && samples_used < 32; i += step) {
-                int delta = std::abs((int)raw[i] - 128);
-                sum += (uint32_t)delta;
-                samples_used++;
+                for (size_t i = 0; i < len && samples_used < 32; i += step) {
+                    int delta = std::abs((int)raw[i] - 128);
+                    sum += (uint32_t)delta;
+                    samples_used++;
+                }
+
+                uint32_t avg = (samples_used > 0) ? (sum / samples_used) : 0;
+                int level = (int)((avg * 100) / 45);
+                if (level < 6) level = 0;
+                if (level > 100) level = 100;
+                level_to_send = static_cast<uint8_t>(level);
             }
-
-            uint32_t avg = (samples_used > 0) ? (sum / samples_used) : 0;
-            int level = (int)((avg * 100) / 45);
-            if (level < 6) level = 0;
-            if (level > 100) level = 100;
-            sendMouthLevel((uint8_t)level);
-        }  
+            audio_service_.PushPacketToDecodeQueue(std::move(packet));
+            sendMouthLevel(level_to_send);
         }
     });
 
