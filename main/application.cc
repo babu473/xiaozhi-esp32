@@ -19,13 +19,13 @@
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include <cstdlib>
 
 #include <esp_now.h>
 #include <esp_wifi.h>
-#include <cstdlib>
 
 static uint8_t anima_receiver_mac[] = {0x28, 0x84, 0x85, 0x8A, 0x71, 0x28};
-static uint8_t last_sent_mouth_level = 255;
+static uint32_t mouth_packet_counter = 0;
 
 static void initEspNowForAnima() {
     esp_err_t err = esp_now_init();
@@ -38,12 +38,6 @@ static void initEspNowForAnima() {
 
 static void sendMouthLevel(uint8_t level) {
     if (level > 100) level = 100;
-
-    int diff = std::abs(static_cast<int>(level) - static_cast<int>(last_sent_mouth_level));
-    if (last_sent_mouth_level != 255 && level > 0 && diff < 4) {
-        return;
-    }
-    last_sent_mouth_level = level;
 
     initEspNowForAnima();
 
@@ -116,13 +110,10 @@ void Application::Initialize() {
     auto& board = Board::GetInstance();
     SetDeviceState(kDeviceStateStarting);
 
-    // Setup the display
     auto display = board.GetDisplay();
     display->SetupUI();
-    // Print board name/version info
     display->SetChatMessage("system", SystemInfo::GetUserAgent().c_str());
 
-    // Setup the audio service
     auto codec = board.GetAudioCodec();
     audio_service_.Initialize(codec);
     audio_service_.Start();
@@ -147,8 +138,6 @@ void Application::Initialize() {
     };
     audio_service_.SetCallbacks(callbacks);
 
-    // Load local fonts, images and speech models before starting the network. A pending
-    // update must finish first: these resources can reference the partition being rewritten.
     {
         Settings settings("assets", false);
         if (settings.GetString("download_url").empty()) {
@@ -156,21 +145,17 @@ void Application::Initialize() {
         }
     }
 
-    // Add state change listeners
     state_machine_.AddStateChangeListener([this](DeviceState old_state, DeviceState new_state) {
         xEventGroupSetBits(event_group_, MAIN_EVENT_STATE_CHANGED);
     });
 
-    // Start the clock timer to update the status bar
     esp_timer_start_periodic(clock_timer_handle_, 1000000);
 
-    // Add MCP common tools (only once during initialization)
     auto& mcp_server = McpServer::GetInstance();
     mcp_server.AddCommonTools();
     mcp_server.AddUserOnlyTools();
     mcp_server.LogToolInventory();
 
-    // Set network event callback for UI updates and network state handling
     board.SetNetworkEventCallback([this](NetworkEvent event, const std::string& data) {
         auto display = Board::GetInstance().GetDisplay();
 
@@ -225,11 +210,9 @@ void Application::Initialize() {
         }
     });
 
-    // Start network asynchronously
     board.StartNetwork();
     initEspNowForAnima();
 
-    // Update the status bar immediately to show the network state
     display->UpdateStatusBar(true);
 }
 
@@ -596,36 +579,27 @@ void Application::InitializeProtocol() {
                 const uint8_t* raw = packet->payload.data();
                 size_t len = packet->payload.size();
 
-                // पैकेट के अंदर बाइट्स की रेंज और बदलाव से 0-100 का डायनामिक लेवल निकालें
-                uint8_t min_b = 255;
-                uint8_t max_b = 0;
-                uint32_t diff_sum = 0;
-                size_t step = (len > 48) ? (len / 48) : 1;
+                uint32_t energy = 0;
+                size_t step = (len > 24) ? (len / 24) : 1;
                 size_t count = 0;
-                uint8_t prev_b = raw[0];
-
                 for (size_t i = 0; i < len; i += step) {
-                    uint8_t b = raw[i];
-                    if (b < min_b) min_b = b;
-                    if (b > max_b) max_b = b;
-                    diff_sum += static_cast<uint32_t>(std::abs(static_cast<int>(b) - static_cast<int>(prev_b)));
-                    prev_b = b;
+                    energy += static_cast<uint32_t>(std::abs(static_cast<int>(raw[i]) - 128));
                     count++;
                 }
+                uint32_t avg = (count > 0) ? (energy / count) : 20;
 
-                uint32_t spread = (max_b >= min_b) ? static_cast<uint32_t>(max_b - min_b) : 0;
-                uint32_t avg_diff = (count > 0) ? (diff_sum / count) : 0;
-
-                // spread और avg_diff के आधार पर 0..100 लेवल तैयार करें
-                int level = static_cast<int>(((spread * 55) / 180) + ((avg_diff * 45) / 70));
-                if (level < 8) level = 0;
-                if (level > 100) level = 100;
+                mouth_packet_counter++;
+                static const uint8_t wave_table[] = {25, 65, 38, 85, 30, 72, 45, 92, 28, 60};
+                uint8_t wave = wave_table[mouth_packet_counter % 10];
+                int level = static_cast<int>(wave) + static_cast<int>((avg % 18)) - 8;
+                if (level < 20) level = 20;
+                if (level > 98) level = 98;
                 level_to_send = static_cast<uint8_t>(level);
             }
             audio_service_.PushPacketToDecodeQueue(std::move(packet));
             sendMouthLevel(level_to_send);
         } else {
-            last_sent_mouth_level = 0;
+            mouth_packet_counter = 0;
             sendMouthLevel(0);
         }
     });
@@ -642,7 +616,7 @@ void Application::InitializeProtocol() {
 
     protocol_->OnAudioChannelClosed([this, &board]() {
         board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
-        last_sent_mouth_level = 0;
+        mouth_packet_counter = 0;
         sendMouthLevel(0);
         Schedule([this]() {
             auto display = Board::GetInstance().GetDisplay();
@@ -701,7 +675,7 @@ void Application::InitializeProtocol() {
                     SetDeviceState(kDeviceStateSpeaking);
                 });
             } else if (strcmp(state->valuestring, "stop") == 0) {
-                last_sent_mouth_level = 0;
+                mouth_packet_counter = 0;
                 sendMouthLevel(0);
                 Schedule([this]() {
                     if (GetDeviceState() == kDeviceStateSpeaking) {
