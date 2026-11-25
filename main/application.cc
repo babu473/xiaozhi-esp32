@@ -10,7 +10,7 @@
 #include "settings.h"
 #include "system_info.h"
 #include "text_glyph_payload.h"
-#include "websocket_protocol.h" 
+#include "websocket_protocol.h"
 
 #include <driver/gpio.h>
 #include <esp_log.h>
@@ -26,8 +26,19 @@
 
 static uint8_t anima_receiver_mac[] = {0x28, 0x84, 0x85, 0x8A, 0x71, 0x28};
 
+static void initEspNowForAnima() {
+    esp_err_t err = esp_now_init();
+    if (err == ESP_OK || err == ESP_ERR_ESPNOW_EXIST) {
+        ESP_LOGI("ESPNOW", "ESP-NOW initialized");
+    } else {
+        ESP_LOGE("ESPNOW", "esp_now_init failed: %s", esp_err_to_name(err));
+    }
+}
+
 static void sendMouthLevel(uint8_t level) {
     if (level > 100) level = 100;
+
+    initEspNowForAnima();
 
     uint8_t primary_chan = 0;
     wifi_second_chan_t second_chan = WIFI_SECOND_CHAN_NONE;
@@ -218,6 +229,7 @@ void Application::Initialize() {
 
     // Start network asynchronously
     board.StartNetwork();
+    initEspNowForAnima();
 
     // Update the status bar immediately to show the network state
     display->UpdateStatusBar(true);
